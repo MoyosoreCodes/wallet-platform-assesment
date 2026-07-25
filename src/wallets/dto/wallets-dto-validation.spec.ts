@@ -24,8 +24,8 @@ describe('Wallet DTO validation', () => {
 
   describe('DepositDto / WithdrawDto', () => {
     it('accepts a positive amount', async () => {
-      expect(await validate(plainToInstance(DepositDto, { amount: 100 }))).toHaveLength(0);
-      expect(await validate(plainToInstance(WithdrawDto, { amount: 100 }))).toHaveLength(0);
+      expect(await validate(plainToInstance(DepositDto, { amount: 100, currency: 'GHS' }))).toHaveLength(0);
+      expect(await validate(plainToInstance(WithdrawDto, { amount: 100, currency: 'GHS' }))).toHaveLength(0);
     });
 
     it('rejects a zero, negative, or missing amount', async () => {

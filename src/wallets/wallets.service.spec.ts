@@ -28,6 +28,7 @@ describe('WalletsService', () => {
   const mockSession = {
     withTransaction: jest.fn(async (fn: () => Promise<unknown>) => fn()),
     endSession: jest.fn(),
+    abortTransaction: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -35,6 +36,7 @@ describe('WalletsService', () => {
       create: jest.fn(),
       findById: jest.fn(),
       findByIdAndUpdate: jest.fn(),
+      findOneAndUpdate: jest.fn(),
     };
     transferModel = {
       create: jest.fn(),
@@ -150,33 +152,38 @@ describe('WalletsService', () => {
     it('increments the balance atomically and records a ledger credit', async () => {
       const walletId = new Types.ObjectId().toString();
       const updatedWallet = { id: walletId, _id: walletId, balance: 150 };
-      walletModel.findByIdAndUpdate.mockResolvedValue(updatedWallet);
+      walletModel.findOneAndUpdate.mockResolvedValue(updatedWallet);
       const transaction = { _id: new Types.ObjectId() };
       transactionsService.create.mockResolvedValue(transaction);
+      const depositDto = { amount: 50, currency: 'GHS' };
 
-      const result = await service.deposit(walletId, { amount: 50 });
+      const result = await service.deposit(walletId, depositDto);
 
-      expect(walletModel.findByIdAndUpdate).toHaveBeenCalledWith(
-        walletId,
-        { $inc: { balance: 50 } },
-        { new: true },
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ _id: walletId, currency: depositDto.currency }),
+        { $inc: { balance: depositDto.amount } },
+        { new: true, session: mockSession },
       );
+
       expect(transactionsService.create).toHaveBeenCalledWith(
-        expect.objectContaining({ type: TransactionType.DEPOSIT, amount: 50 }),
+        expect.objectContaining({ type: TransactionType.DEPOSIT, amount: depositDto.amount }),
+        mockSession,
       );
+
       expect(ledgerService.recordCredit).toHaveBeenCalledWith(
         updatedWallet._id,
         transaction._id,
-        50,
-        150,
+        depositDto.amount,
+        updatedWallet.balance,
+        mockSession,
       );
       expect(result).toBe(updatedWallet);
     });
 
     it('throws NotFoundException when the wallet does not exist', async () => {
-      walletModel.findByIdAndUpdate.mockResolvedValue(null);
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
-      await expect(service.deposit('missing-id', { amount: 10 })).rejects.toThrow(
+      await expect(service.deposit('missing-id', { amount: 10, currency: 'GHS' })).rejects.toThrow(
         NotFoundException,
       );
     });
@@ -184,31 +191,57 @@ describe('WalletsService', () => {
 
   describe('withdraw', () => {
     it('debits the wallet when the balance is sufficient', async () => {
-      const wallet = { id: 'w1', _id: 'w1', balance: 100, save: jest.fn() };
-      walletModel.findById.mockResolvedValue(wallet);
+      const walletId = new Types.ObjectId().toString();
+      const updatedWallet = { id: walletId, _id: walletId, balance: 60 };
+      walletModel.findOneAndUpdate.mockResolvedValue(updatedWallet);
       const transaction = { _id: new Types.ObjectId() };
       transactionsService.create.mockResolvedValue(transaction);
+      const withdrawDto = { amount: 40, currency: 'GHS' };
 
-      const result = await service.withdraw('w1', { amount: 40 });
+      const result = await service.withdraw(walletId, withdrawDto);
 
-      expect(wallet.balance).toBe(60);
-      expect(wallet.save).toHaveBeenCalled();
-      expect(ledgerService.recordDebit).toHaveBeenCalledWith(wallet._id, transaction._id, 40, 60);
-      expect(result).toBe(wallet);
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          _id: walletId,
+          currency: withdrawDto.currency,
+          balance: { $gte: withdrawDto.amount },
+        }),
+        { $inc: { balance: -withdrawDto.amount } },
+        { new: true, session: mockSession },
+      );
+
+      expect(transactionsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: TransactionType.WITHDRAWAL,
+          amount: withdrawDto.amount,
+          balanceAfter: updatedWallet.balance,
+        }),
+        mockSession,
+      );
+
+      expect(ledgerService.recordDebit).toHaveBeenCalledWith(
+        updatedWallet._id,
+        transaction._id,
+        withdrawDto.amount,
+        updatedWallet.balance,
+        mockSession,
+      );
+      expect(result).toBe(updatedWallet);
     });
 
     it('rejects a withdrawal larger than the current balance', async () => {
-      const wallet = { id: 'w1', _id: 'w1', balance: 10, save: jest.fn() };
-      walletModel.findById.mockResolvedValue(wallet);
+      // const wallet = { id: 'w1', _id: 'w1', balance: 10 };
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
-      await expect(service.withdraw('w1', { amount: 40 })).rejects.toThrow(BadRequestException);
-      expect(wallet.save).not.toHaveBeenCalled();
+      await expect(service.withdraw('w1', { amount: 40, currency: 'GHS' })).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('throws NotFoundException when the wallet does not exist', async () => {
       walletModel.findById.mockResolvedValue(null);
 
-      await expect(service.withdraw('missing-id', { amount: 10 })).rejects.toThrow(
+      await expect(service.withdraw('missing-id', { amount: 10, currency: 'GHS' })).rejects.toThrow(
         NotFoundException,
       );
     });

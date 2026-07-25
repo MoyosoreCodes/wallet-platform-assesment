@@ -7,6 +7,10 @@ export class WithdrawDto {
   @IsPositive()
   amount: number;
 
+  @ApiProperty()
+  @IsString()
+  currency: string;
+
   @ApiPropertyOptional({ description: 'Client supplied idempotency key' })
   @IsOptional()
   @IsString()

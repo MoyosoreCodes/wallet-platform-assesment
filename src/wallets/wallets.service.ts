@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
-import { Connection, Model } from 'mongoose';
+import { Connection, Model, ClientSession } from 'mongoose';
 import { LedgerEntry, LedgerEntryDocument } from '../ledger/schemas/ledger-entry.schema';
 import { LedgerService } from '../ledger/ledger.service';
 import { OutboxService } from '../outbox/outbox.service';
@@ -85,52 +85,115 @@ export class WalletsService {
     return wallet;
   }
 
-  async deposit(id: string, dto: DepositDto) {
-    const wallet = await this.walletModel.findByIdAndUpdate(
-      id,
-      { $inc: { balance: dto.amount } },
-      { new: true },
-    );
+  async deposit(id: string, dto: DepositDto, session?: ClientSession) {
+    /* 
+      initial fix for negative balance under load: 
+      replace in memory balance update with db conditional update (all checks done in the DB during the transaction)
+      the entire actions for this service would be done with one transaction
+      TODO: add existing transaction reference before `session.withTransaction` 
+    */
+    const externalSession = Boolean(session);
 
-    if (!wallet) {
-      throw new NotFoundException(`Wallet ${id} not found`);
+    if (!session || (session !== undefined && !session.inTransaction()))
+      session = await this.connection.startSession();
+
+    let wallet;
+
+    try {
+      await session.withTransaction(
+        async () => {
+          wallet = await this.walletModel.findOneAndUpdate(
+            { _id: id, currency: dto.currency },
+            { $inc: { balance: dto.amount } },
+            { new: true, session },
+          );
+
+          if (!wallet) throw new NotFoundException(`Wallet ${id} not found`);
+
+          const transaction = await this.transactionsService.create(
+            {
+              walletId: wallet.id,
+              type: TransactionType.DEPOSIT,
+              amount: dto.amount,
+              balanceAfter: wallet.balance,
+              reference: dto.reference,
+            },
+            session,
+          );
+
+          await this.ledgerService.recordCredit(
+            wallet._id,
+            transaction._id,
+            dto.amount,
+            wallet.balance,
+            session,
+          );
+        },
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority' },
+        },
+      );
+    } finally {
+      if (!externalSession) await session.endSession();
     }
-
-    const transaction = await this.transactionsService.create({
-      walletId: wallet.id,
-      type: TransactionType.DEPOSIT,
-      amount: dto.amount,
-      balanceAfter: wallet.balance,
-      reference: dto.reference,
-    });
-
-    await this.ledgerService.recordCredit(wallet._id, transaction._id, dto.amount, wallet.balance);
 
     return wallet;
   }
 
-  async withdraw(id: string, dto: WithdrawDto) {
-    const wallet = await this.walletModel.findById(id);
-    if (!wallet) {
-      throw new NotFoundException(`Wallet ${id} not found`);
+  async withdraw(id: string, dto: WithdrawDto, session?: ClientSession) {
+    /* 
+      initial fix for negative balance under load: 
+      replace in memory balance update with db conditional update (all checks done in the DB during the transaction)
+      the entire actions for this service would be done with one transaction
+      TODO: add existing transaction reference before `session.withTransaction` 
+    */
+    const externalSession = Boolean(session);
+
+    if (!session || (session !== undefined && !session.inTransaction()))
+      session = await this.connection.startSession();
+
+    let wallet;
+
+    try {
+      await session.withTransaction(
+        async () => {
+          wallet = await this.walletModel.findOneAndUpdate(
+            { _id: id, currency: dto.currency, balance: { $gte: dto.amount } },
+            { $inc: { balance: -dto.amount } },
+            { new: true, session },
+          );
+
+          if (!wallet)
+            throw new NotFoundException(`Wallet ${id} not found or insufficient balance`);
+
+          const transaction = await this.transactionsService.create(
+            {
+              walletId: wallet.id,
+              type: TransactionType.WITHDRAWAL,
+              amount: dto.amount,
+              balanceAfter: wallet.balance,
+              reference: dto.reference,
+            },
+            session,
+          );
+
+          await this.ledgerService.recordDebit(
+            wallet._id,
+            transaction._id,
+            dto.amount,
+            wallet.balance,
+            session,
+          );
+        },
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority' },
+        },
+      );
+    } finally {
+      if (!externalSession) await session.endSession();
     }
-
-    if (wallet.balance < dto.amount) {
-      throw new BadRequestException('Insufficient balance');
-    }
-
-    wallet.balance -= dto.amount;
-    await wallet.save();
-
-    const transaction = await this.transactionsService.create({
-      walletId: wallet.id,
-      type: TransactionType.WITHDRAWAL,
-      amount: dto.amount,
-      balanceAfter: wallet.balance,
-      reference: dto.reference,
-    });
-
-    await this.ledgerService.recordDebit(wallet._id, transaction._id, dto.amount, wallet.balance);
 
     return wallet;
   }
@@ -197,6 +260,7 @@ export class WalletsService {
           session,
         );
 
+        // TODO: replace with outbox
         await this.rabbitMQService.publish('transfer.initiated', {
           transferId: transfer._id.toString(),
           fromWalletId: fromWallet._id.toString(),

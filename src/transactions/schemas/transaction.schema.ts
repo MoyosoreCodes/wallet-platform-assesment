@@ -34,7 +34,7 @@ export class Transaction {
   balanceAfter?: number;
 
   // Idempotency key supplied by the caller, or derived for internally generated transactions.
-  @Prop({ index: true })
+  @Prop({ index: true, unique: true, sparse: true })
   reference?: string;
 
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Transfer' })
@@ -50,3 +50,4 @@ export class Transaction {
 export const TransactionSchema = SchemaFactory.createForClass(Transaction);
 
 TransactionSchema.index({ walletId: 1, createdAt: -1 });
+
