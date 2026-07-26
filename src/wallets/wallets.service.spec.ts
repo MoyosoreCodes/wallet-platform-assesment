@@ -7,7 +7,7 @@ import { LedgerEntry } from '../ledger/schemas/ledger-entry.schema';
 import { OutboxService } from '../outbox/outbox.service';
 import { RabbitMQService } from '../queue/rabbitmq.service';
 import { RedisService } from '../redis/redis.service';
-import { Transaction, TransactionType } from '../transactions/schemas/transaction.schema';
+import { Transaction, TransactionStatus, TransactionType } from '../transactions/schemas/transaction.schema';
 import { TransactionsService } from '../transactions/transactions.service';
 import { Transfer } from './schemas/transfer.schema';
 import { Wallet } from './schemas/wallet.schema';
@@ -49,7 +49,7 @@ describe('WalletsService', () => {
     ledgerEntryModel = {
       find: jest.fn(),
     };
-    transactionsService = { create: jest.fn() };
+    transactionsService = { create: jest.fn(), findByReference: jest.fn() };
     ledgerService = { recordCredit: jest.fn(), recordDebit: jest.fn() };
     outboxService = { enqueue: jest.fn() };
     rabbitMQService = { publish: jest.fn() };
@@ -187,6 +187,73 @@ describe('WalletsService', () => {
         NotFoundException,
       );
     });
+
+    it('returns the original wallet when retried with a duplicate reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const existingWallet = { id: walletId, _id: walletId, balance: 150 };
+      walletModel.findOneAndUpdate.mockResolvedValue({ id: walletId, _id: walletId, balance: 200 });
+      transactionsService.create.mockRejectedValue(
+        Object.assign(new Error('E11000 duplicate key'), {
+          code: 11000,
+          keyPattern: { reference: 1 },
+        }),
+      );
+      walletModel.findById.mockResolvedValue(existingWallet);
+
+      const result = await service.deposit(walletId, {
+        amount: 50,
+        currency: 'GHS',
+        reference: 'dup-ref',
+      });
+
+      expect(walletModel.findById).toHaveBeenCalledWith(walletId);
+      expect(result).toBe(existingWallet);
+    });
+
+    it('re-throws a non-duplicate error instead of swallowing it', async () => {
+      const walletId = new Types.ObjectId().toString();
+      walletModel.findOneAndUpdate.mockResolvedValue({ id: walletId, _id: walletId, balance: 200 });
+      transactionsService.create.mockRejectedValue(new Error('unexpected write failure'));
+
+      await expect(
+        service.deposit(walletId, { amount: 50, currency: 'GHS', reference: 'ref-1' }),
+      ).rejects.toThrow('unexpected write failure');
+      expect(walletModel.findById).not.toHaveBeenCalled();
+    });
+
+    it('returns the existing wallet without re-applying when a completed transaction exists for the reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const existingWallet = { id: walletId, _id: walletId, balance: 150 };
+      transactionsService.findByReference.mockResolvedValue({ status: TransactionStatus.COMPLETED });
+      walletModel.findById.mockResolvedValue(existingWallet);
+
+      const result = await service.deposit(walletId, {
+        amount: 50,
+        currency: 'GHS',
+        reference: 'seen-ref',
+      });
+
+      expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(result).toBe(existingWallet);
+    });
+
+    it('does not short-circuit when the existing transaction for the reference is not completed', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const updatedWallet = { id: walletId, _id: walletId, balance: 150 };
+      transactionsService.findByReference.mockResolvedValue({ status: TransactionStatus.PENDING });
+      walletModel.findOneAndUpdate.mockResolvedValue(updatedWallet);
+      transactionsService.create.mockResolvedValue({ _id: new Types.ObjectId() });
+
+      const result = await service.deposit(walletId, {
+        amount: 50,
+        currency: 'GHS',
+        reference: 'pending-ref',
+      });
+
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalled();
+      expect(result).toBe(updatedWallet);
+    });
   });
 
   describe('withdraw', () => {
@@ -230,7 +297,6 @@ describe('WalletsService', () => {
     });
 
     it('rejects a withdrawal larger than the current balance', async () => {
-      // const wallet = { id: 'w1', _id: 'w1', balance: 10 };
       walletModel.findOneAndUpdate.mockResolvedValue(null);
 
       await expect(service.withdraw('w1', { amount: 40, currency: 'GHS' })).rejects.toThrow(
@@ -244,6 +310,46 @@ describe('WalletsService', () => {
       await expect(service.withdraw('missing-id', { amount: 10, currency: 'GHS' })).rejects.toThrow(
         NotFoundException,
       );
+    });
+
+    it('records the debit only once when the same withdrawal is retried with the same reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const debitedWallet = { id: walletId, _id: walletId, balance: 60 };
+      walletModel.findOneAndUpdate.mockResolvedValue(debitedWallet);
+      transactionsService.create
+        .mockResolvedValueOnce({ _id: new Types.ObjectId() })
+        .mockRejectedValueOnce(
+          Object.assign(new Error('E11000 duplicate key'), {
+            code: 11000,
+            keyPattern: { reference: 1 },
+          }),
+        );
+      walletModel.findById.mockResolvedValue(debitedWallet);
+
+      const dto = { amount: 40, currency: 'GHS', reference: 'retry-ref' };
+      await service.withdraw(walletId, dto);
+      const retry = await service.withdraw(walletId, dto);
+
+      expect(transactionsService.create).toHaveBeenCalledTimes(2);
+      expect(ledgerService.recordDebit).toHaveBeenCalledTimes(1);
+      expect(retry).toBe(debitedWallet);
+    });
+
+    it('returns the existing wallet without re-applying when a completed transaction exists for the reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const existingWallet = { id: walletId, _id: walletId, balance: 60 };
+      transactionsService.findByReference.mockResolvedValue({ status: TransactionStatus.COMPLETED });
+      walletModel.findById.mockResolvedValue(existingWallet);
+
+      const result = await service.withdraw(walletId, {
+        amount: 40,
+        currency: 'GHS',
+        reference: 'seen-ref',
+      });
+
+      expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(result).toBe(existingWallet);
     });
   });
 

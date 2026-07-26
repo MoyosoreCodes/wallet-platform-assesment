@@ -19,6 +19,7 @@ import { TransferDto } from './dto/transfer.dto';
 import { WithdrawDto } from './dto/withdraw.dto';
 import { Transfer, TransferDocument, TransferStatus } from './schemas/transfer.schema';
 import { Wallet, WalletDocument } from './schemas/wallet.schema';
+import { isDuplicateKey } from '../common/helpers/db/duplicate-key-handler';
 
 @Injectable()
 export class WalletsService {
@@ -86,16 +87,16 @@ export class WalletsService {
   }
 
   async deposit(id: string, dto: DepositDto, session?: ClientSession) {
-    /* 
-      initial fix for negative balance under load: 
-      replace in memory balance update with db conditional update (all checks done in the DB during the transaction)
-      the entire actions for this service would be done with one transaction
-      TODO: add existing transaction reference before `session.withTransaction` 
-    */
     const externalSession = Boolean(session);
 
     if (!session || (session !== undefined && !session.inTransaction()))
       session = await this.connection.startSession();
+
+    if (dto.reference) {
+      const existingTransaction = await this.transactionsService.findByReference(dto.reference);
+      if (existingTransaction && existingTransaction.status == TransactionStatus.COMPLETED)
+        return this.walletModel.findById(id);
+    }
 
     let wallet;
 
@@ -134,6 +135,10 @@ export class WalletsService {
           writeConcern: { w: 'majority' },
         },
       );
+    } catch (error) {
+      if (dto.reference && isDuplicateKey(error, ['reference']))
+        return this.walletModel.findById(id);
+      throw error;
     } finally {
       if (!externalSession) await session.endSession();
     }
@@ -142,16 +147,16 @@ export class WalletsService {
   }
 
   async withdraw(id: string, dto: WithdrawDto, session?: ClientSession) {
-    /* 
-      initial fix for negative balance under load: 
-      replace in memory balance update with db conditional update (all checks done in the DB during the transaction)
-      the entire actions for this service would be done with one transaction
-      TODO: add existing transaction reference before `session.withTransaction` 
-    */
     const externalSession = Boolean(session);
 
     if (!session || (session !== undefined && !session.inTransaction()))
       session = await this.connection.startSession();
+
+    if (dto.reference) {
+      const existingTransaction = await this.transactionsService.findByReference(dto.reference);
+      if (existingTransaction && existingTransaction.status == TransactionStatus.COMPLETED)
+        return this.walletModel.findById(id);
+    }
 
     let wallet;
 
@@ -191,6 +196,10 @@ export class WalletsService {
           writeConcern: { w: 'majority' },
         },
       );
+    } catch (error) {
+      if (dto.reference && isDuplicateKey(error, ['reference']))
+        return this.walletModel.findById(id);
+      throw error;
     } finally {
       if (!externalSession) await session.endSession();
     }
