@@ -37,7 +37,7 @@ describe('Wallets (integration)', () => {
       .send({ userId: 'user-2', ownerName: 'Kwame Mensah' })
       .expect(201);
 
-    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 200 }).expect(201);
+    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 200, currency: 'GHS' }).expect(201);
 
     const ledgerEntryModel = getModel(app, LedgerEntry.name);
     const ledgerEntries = await ledgerEntryModel.find({ walletId: wallet.body._id }).exec();
@@ -53,9 +53,9 @@ describe('Wallets (integration)', () => {
       .send({ userId: 'user-3', ownerName: 'Efua Asante' })
       .expect(201);
 
-    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 50 }).expect(201);
+    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 50, currency: 'GHS' }).expect(201);
 
-    await client.post(`/wallets/${wallet.body._id}/withdraw`).send({ amount: 100 }).expect(400);
+    await client.post(`/wallets/${wallet.body._id}/withdraw`).send({ amount: 100, currency: 'GHS' }).expect(400);
   });
 
   it('rejects malformed wallet creation payloads', async () => {

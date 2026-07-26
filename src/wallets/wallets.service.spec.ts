@@ -301,15 +301,15 @@ describe('WalletsService', () => {
       walletModel.findOneAndUpdate.mockResolvedValue(null);
 
       await expect(service.withdraw('w1', { amount: 40, currency: 'GHS' })).rejects.toThrow(
-        NotFoundException,
+        BadRequestException,
       );
     });
 
-    it('throws NotFoundException when the wallet does not exist', async () => {
-      walletModel.findById.mockResolvedValue(null);
+    it('rejects a withdrawal from a missing or underfunded wallet with a bad request', async () => {
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
       await expect(service.withdraw('missing-id', { amount: 10, currency: 'GHS' })).rejects.toThrow(
-        NotFoundException,
+        BadRequestException,
       );
     });
 
@@ -408,7 +408,7 @@ describe('WalletsService', () => {
           toWalletId: toId.toString(),
           amount: 10,
         }),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('debits the sender atomically, records the ledger entry, and stages a transfer.initiated outbox event', async () => {

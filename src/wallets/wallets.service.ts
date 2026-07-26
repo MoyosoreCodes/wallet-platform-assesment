@@ -169,7 +169,7 @@ export class WalletsService {
           );
 
           if (!wallet)
-            throw new NotFoundException(`Wallet ${id} not found or insufficient balance`);
+            throw new BadRequestException(`Wallet ${id} not found or has insufficient balance`);
 
           const transaction = await this.transactionsService.create(
             {
@@ -257,8 +257,8 @@ export class WalletsService {
           );
 
           if (!from)
-            throw new NotFoundException(
-              `Source wallet ${dto.fromWalletId} not found or insufficient balance`,
+            throw new BadRequestException(
+              `Source wallet ${dto.fromWalletId} not found or has insufficient balance`,
             );
 
           const [debitTransaction] = await this.transactionModel.create(
