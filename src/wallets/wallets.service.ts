@@ -212,13 +212,9 @@ export class WalletsService {
       throw new BadRequestException('Cannot transfer to the same wallet');
 
     if (dto.idempotencyKey) {
-      // ? handle failed transfers
       const existingTransfer = await this.transferModel
         .findOne({
           idempotencyKey: dto.idempotencyKey,
-          // status: {
-          //   $in: [TransferStatus.PENDING, TransferStatus.COMPLETED],
-          // },
         })
         .lean();
 

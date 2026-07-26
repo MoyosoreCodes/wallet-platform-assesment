@@ -56,7 +56,7 @@ export class TransferEventsConsumer implements OnModuleInit {
       channel.ack(message);
     } catch (error) {
       this.logger.error(`Failed to process transfer event: ${(error as Error).message}`);
-      channel.ack(message);
+      channel.nack(message);
     }
   }
 
