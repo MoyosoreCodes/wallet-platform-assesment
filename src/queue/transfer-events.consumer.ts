@@ -50,14 +50,40 @@ export class TransferEventsConsumer implements OnModuleInit {
       return;
     }
 
+    let event: TransferInitiatedEvent;
     try {
-      const event: TransferInitiatedEvent = JSON.parse(message.content.toString());
+      event = JSON.parse(message.content.toString());
+    } catch {
+      this.logger.error('Discarding malformed transfer event: invalid JSON');
+      channel.nack(message, false, false);
+      return;
+    }
+
+    if (!this.isValidTransferEvent(event)) {
+      this.logger.error(`Discarding invalid transfer event: ${JSON.stringify(event)}`);
+      channel.nack(message, false, false);
+      return;
+    }
+
+    try {
       await this.completeTransfer(event);
       channel.ack(message);
     } catch (error) {
       this.logger.error(`Failed to process transfer event: ${(error as Error).message}`);
-      channel.nack(message);
+      channel.nack(message, false, false);
     }
+  }
+
+  private isValidTransferEvent(event: TransferInitiatedEvent) {
+    return (
+      !!event &&
+      typeof event.transferId === 'string' &&
+      typeof event.fromWalletId === 'string' &&
+      typeof event.toWalletId === 'string' &&
+      typeof event.amount === 'number' &&
+      Number.isFinite(event.amount) &&
+      event.amount > 0
+    );
   }
 
   private async completeTransfer(event: TransferInitiatedEvent) {

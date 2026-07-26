@@ -32,7 +32,6 @@ export class WalletsService {
     private readonly transactionsService: TransactionsService,
     private readonly ledgerService: LedgerService,
     private readonly outboxService: OutboxService,
-    private readonly rabbitMQService: RabbitMQService,
     private readonly redisService: RedisService,
   ) {}
 
@@ -211,6 +210,8 @@ export class WalletsService {
     if (dto.fromWalletId === dto.toWalletId)
       throw new BadRequestException('Cannot transfer to the same wallet');
 
+    if (dto.amount <= 0) throw new BadRequestException('Transfer amount must be greater than zero');
+
     if (dto.idempotencyKey) {
       const existingTransfer = await this.transferModel
         .findOne({
@@ -284,13 +285,6 @@ export class WalletsService {
             session,
           );
 
-          // replaced with outbox
-          // await this.rabbitMQService.publish('transfer.initiated', {
-          //   transferId: transfer._id.toString(),
-          //   fromWalletId: from._id.toString(),
-          //   toWalletId: dto.toWalletId,
-          //   amount: dto.amount,
-          // });
           await this.outboxService.enqueue(
             'transfer.initiated',
             {
@@ -325,6 +319,93 @@ export class WalletsService {
     }
 
     return transfer;
+  }
+
+  async refund(transferId: string) {
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(
+        async () => {
+          const transfer = await this.transferModel.findOneAndUpdate(
+            { _id: transferId, status: TransferStatus.PENDING },
+            { $set: { status: TransferStatus.REFUNDED } },
+            { new: true, session },
+          );
+
+          if (!transfer) return;
+
+          const fromWallet = await this.walletModel.findOneAndUpdate(
+            { _id: transfer.fromWalletId },
+            { $inc: { balance: transfer.amount } },
+            { new: true, session },
+          );
+
+          if (!fromWallet) throw new NotFoundException(`Wallet ${transfer.fromWalletId} not found`);
+
+          const reversal = await this.transactionsService.create(
+            {
+              walletId: fromWallet.id,
+              type: TransactionType.TRANSFER_IN,
+              amount: transfer.amount,
+              balanceAfter: fromWallet.balance,
+              transferId: transfer._id.toString(),
+              counterpartyWalletId: transfer.toWalletId.toString(),
+              reference: `refund:${transferId}`,
+            },
+            session,
+          );
+
+          await this.ledgerService.recordCredit(
+            fromWallet._id,
+            reversal._id,
+            transfer.amount,
+            fromWallet.balance,
+            session,
+          );
+        },
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority' },
+        },
+      );
+    } finally {
+      await session.endSession();
+    }
+  }
+
+  async retryTransfer(transferId: string) {
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(
+        async () => {
+          const transfer = await this.transferModel.findOneAndUpdate(
+            { _id: transferId },
+            { $inc: { retryCount: 1 } },
+            { new: true, session },
+          );
+
+          if (!transfer) throw new NotFoundException(`Transfer ${transferId} not found`);
+
+          await this.outboxService.enqueue(
+            'transfer.retry',
+            {
+              transferId: transfer._id.toString(),
+              fromWalletId: transfer.fromWalletId.toString(),
+              toWalletId: transfer.toWalletId.toString(),
+              amount: transfer.amount,
+              idempotencyKey: transfer.idempotencyKey,
+            },
+            session,
+          );
+        },
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority' },
+        },
+      );
+    } finally {
+      await session.endSession();
+    }
   }
 
   async getDashboard(id: string) {
