@@ -117,6 +117,22 @@ out. Neither one can make the database itself wrong.
 - Requiring a currency on deposit and withdraw. This is a breaking change to the
   API, kept on purpose so a caller cannot deposit in the wrong currency by
   accident.
+- Doing the dashboard reads in the database instead of in the app. The old
+  endpoint loaded every transaction into memory, ran one ledger query per
+  transaction, then kept the last 10. I split it into three endpoints (summary,
+  transactions, and ledger entries). The transactions and ledger endpoints page
+  and project inside an aggregation, so the app only ever holds one page at a
+  time. The summary totals come from one grouped aggregation instead of a query
+  per row. The cost is more work pushed onto the database, which is the right
+  place for it.
+- Shaping the history indexes as { walletId: 1, createdAt: -1 }. The queries
+  filter by walletId and sort by newest first, and one index in that shape serves
+  both, so there is no in memory sort. The cost is the usual one for an index, a
+  little more work on writes and some storage.
+- Returning 400 for bad input instead of a 500. A malformed wallet id used to
+  throw an ObjectId cast error that surfaced as a 500. A small pipe now checks the
+  id and returns 400. In the same spirit, a withdraw or transfer against a missing
+  wallet, or one without enough balance, returns 400 with a clear message.
 
 ## 6. Remaining technical debt
 
@@ -140,9 +156,10 @@ Two of the known issues I did not get to:
 - One of the background workers grows its memory over time. It looks like it adds
   an event listener on each run and never removes the old one, so the count keeps
   climbing. I did not confirm the exact spot or fix it.
-- Logs are hard to correlate. There is no shared id running through the log lines
-  for a single request or event, so tracing one incident across the api, the
-  worker, and the consumer has to be done by hand.
+- Logs are hard to correlate. A correlation id is stamped on each HTTP request,
+  but it is not attached to the log lines or passed down to the background workers
+  and the consumer, so tracing one incident across the api and the async side
+  still has to be done by hand.
 
 ## 7. What would you improve with another day?
 
