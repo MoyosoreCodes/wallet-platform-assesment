@@ -42,16 +42,27 @@ export class PendingTransferWorker implements OnModuleInit, OnModuleDestroy {
         .limit(50)
         .exec();
 
-      if (stale.length > 0)
-        this.logger.warn(`Found ${stale.length} transfer(s) pending past the timeout window`);
+      if (stale.length === 0) {
+        return;
+      }
+
+      this.logger.warn(`Found ${stale.length} transfer(s) pending past the timeout window`);
 
       for (const transfer of stale) {
+        const attempts = transfer.retryCount ?? 0;
         try {
-          if ((transfer.retryCount ?? 0) >= this.maxRetryCount) {
+          if (attempts >= this.maxRetryCount) {
+            this.logger.warn(
+              `Transfer ${transfer.id} exhausted ${attempts}/${this.maxRetryCount} retries -> refunding sender`,
+            );
             await this.walletService.refund(transfer.id);
+            this.logger.log(`Transfer ${transfer.id} refunded`);
             continue;
           }
 
+          this.logger.log(
+            `Re-driving transfer ${transfer.id} (attempt ${attempts + 1}/${this.maxRetryCount})`,
+          );
           await this.walletService.retryTransfer(transfer.id);
         } catch (error) {
           this.logger.error(

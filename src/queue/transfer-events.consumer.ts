@@ -50,26 +50,34 @@ export class TransferEventsConsumer implements OnModuleInit {
       return;
     }
 
+    const routingKey = message.fields.routingKey;
+
     let event: TransferInitiatedEvent;
     try {
       event = JSON.parse(message.content.toString());
     } catch {
-      this.logger.error('Discarding malformed transfer event: invalid JSON');
+      this.logger.error(`[${routingKey}] discarding message: payload is not valid JSON`);
       channel.nack(message, false, false);
       return;
     }
 
     if (!this.isValidTransferEvent(event)) {
-      this.logger.error(`Discarding invalid transfer event: ${JSON.stringify(event)}`);
+      this.logger.error(`[${routingKey}] discarding invalid event: ${JSON.stringify(event)}`);
       channel.nack(message, false, false);
       return;
     }
+
+    this.logger.log(
+      `[${routingKey}] received transfer ${event.transferId}: crediting ${event.amount} to wallet ${event.toWalletId}`,
+    );
 
     try {
       await this.completeTransfer(event);
       channel.ack(message);
     } catch (error) {
-      this.logger.error(`Failed to process transfer event: ${(error as Error).message}`);
+      this.logger.error(
+        `[${routingKey}] failed to settle transfer ${event.transferId}, dropping (no requeue): ${(error as Error).message}`,
+      );
       channel.nack(message, false, false);
     }
   }
@@ -136,7 +144,9 @@ export class TransferEventsConsumer implements OnModuleInit {
           );
 
           if (!transfer) throw new Error(`Transfer ${event.transferId} not found, skipping`);
-          this.logger.log(`Transfer ${transfer._id} completed for wallet ${toWallet.id}`);
+          this.logger.log(
+            `Transfer ${transfer._id} settled: credited ${event.amount} to wallet ${toWallet.id} (new balance ${toWallet.balance})`,
+          );
         },
         {
           readConcern: { level: 'snapshot' },
