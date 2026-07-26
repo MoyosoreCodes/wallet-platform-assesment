@@ -56,3 +56,5 @@ TransactionSchema.index(
   { unique: true, partialFilterExpression: { reference: { $type: 'string' } } },
 );
 
+TransactionSchema.index({ type: 1, createdAt: -1 });
+
