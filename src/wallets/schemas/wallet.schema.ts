@@ -17,10 +17,6 @@ export class Wallet {
   @Prop({ required: true, default: 0 })
   balance: number;
 
-  // Intended for optimistic concurrency control on concurrent balance mutations.
-  @Prop({ required: true, default: 0 })
-  version: number;
-
   createdAt?: Date;
   updatedAt?: Date;
 }

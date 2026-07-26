@@ -31,5 +31,6 @@ export default () => ({
       10,
     ),
     pendingTransferTimeoutMs: parseInt(process.env.PENDING_TRANSFER_TIMEOUT_MS || '60000', 10),
+    pendingTransferMaxRetryCount: parseInt(process.env.PENDING_TRANSFER_MAX_RETRY_COUNT || '3', 10),
   },
 });

@@ -46,7 +46,7 @@ describe('Transfer flow (integration)', () => {
       .send({ userId: 'receiver', ownerName: 'Kwame Mensah' })
       .expect(201);
 
-    await client.post(`/wallets/${fromWallet.body._id}/deposit`).send({ amount: 500 }).expect(201);
+    await client.post(`/wallets/${fromWallet.body._id}/deposit`).send({ amount: 500, currency: 'GHS' }).expect(201);
 
     const transferResponse = await client
       .post('/wallets/transfer')
@@ -81,7 +81,7 @@ describe('Transfer flow (integration)', () => {
       .send({ userId: 'receiver-2', ownerName: 'Kofi Boateng' })
       .expect(201);
 
-    await client.post(`/wallets/${fromWallet.body._id}/deposit`).send({ amount: 10 }).expect(201);
+    await client.post(`/wallets/${fromWallet.body._id}/deposit`).send({ amount: 10, currency: 'GHS' }).expect(201);
 
     await client
       .post('/wallets/transfer')

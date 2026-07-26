@@ -24,12 +24,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
       ? exception.getResponse()
       : { message: 'Internal server error' };
 
-    this.logger.error(
-      `${request.method} ${request.url} -> ${status} ${
-        exception instanceof Error ? exception.message : JSON.stringify(exception)
-      }`,
-      exception instanceof Error ? exception.stack : undefined,
-    );
+    const message = `${request.method} ${request.url} -> ${status} ${
+      exception instanceof Error ? exception.message : JSON.stringify(exception)
+    }`;
+
+    if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
+      this.logger.error(message, exception instanceof Error ? exception.stack : undefined);
+    } else {
+      this.logger.warn(message);
+    }
 
     response.status(status).json({
       statusCode: status,

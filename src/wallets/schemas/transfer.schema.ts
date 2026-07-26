@@ -7,6 +7,7 @@ export enum TransferStatus {
   PENDING = 'PENDING',
   COMPLETED = 'COMPLETED',
   FAILED = 'FAILED',
+  REFUNDED = 'REFUNDED',
 }
 
 @Schema({ timestamps: true, collection: 'transfers' })
@@ -29,8 +30,16 @@ export class Transfer {
   @Prop()
   failureReason?: string;
 
+  @Prop({ default: 0, type: Number })
+  retryCount: number;
+
   createdAt?: Date;
   updatedAt?: Date;
 }
 
 export const TransferSchema = SchemaFactory.createForClass(Transfer);
+
+TransferSchema.index(
+  { idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } },
+);

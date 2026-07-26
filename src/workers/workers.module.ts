@@ -4,6 +4,7 @@ import { OutboxModule } from '../outbox/outbox.module';
 import { QueueModule } from '../queue/queue.module';
 import { Transfer, TransferSchema } from '../wallets/schemas/transfer.schema';
 import { Wallet, WalletSchema } from '../wallets/schemas/wallet.schema';
+import { WalletsModule } from '../wallets/wallets.module';
 import { OutboxRelayWorker } from './outbox-relay.worker';
 import { PendingTransferWorker } from './pending-transfer.worker';
 import { WalletEventsWorker } from './wallet-events.worker';
@@ -16,6 +17,7 @@ import { WalletEventsWorker } from './wallet-events.worker';
     ]),
     OutboxModule,
     QueueModule,
+    WalletsModule,
   ],
   providers: [OutboxRelayWorker, PendingTransferWorker, WalletEventsWorker],
 })

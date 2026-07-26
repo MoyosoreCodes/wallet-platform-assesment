@@ -27,12 +27,12 @@ describe('Concurrent wallet operations (integration)', () => {
       .send({ userId: 'concurrent-1', ownerName: 'Akosua Darko' })
       .expect(201);
 
-    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 100 }).expect(201);
+    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 100, currency: 'GHS' }).expect(201);
 
     const concurrentWithdrawals = 10;
     const results = await Promise.allSettled(
       Array.from({ length: concurrentWithdrawals }, () =>
-        client.post(`/wallets/${wallet.body._id}/withdraw`).send({ amount: 20 }),
+        client.post(`/wallets/${wallet.body._id}/withdraw`).send({ amount: 20, currency: 'GHS' }),
       ),
     );
 

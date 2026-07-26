@@ -58,4 +58,14 @@ describe('TransactionsService', () => {
 
     expect(result).toEqual({ items, total: 42, page: 2, limit: 2 });
   });
+
+  it('finds a transaction by its reference', async () => {
+    const txn = { _id: '1', reference: 'ref-1' };
+    transactionModel.findOne.mockReturnValue({ exec: jest.fn().mockResolvedValue(txn) });
+
+    const result = await service.findByReference('ref-1');
+
+    expect(transactionModel.findOne).toHaveBeenCalledWith({ reference: 'ref-1' });
+    expect(result).toBe(txn);
+  });
 });

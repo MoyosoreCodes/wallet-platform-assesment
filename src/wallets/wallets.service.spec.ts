@@ -7,9 +7,9 @@ import { LedgerEntry } from '../ledger/schemas/ledger-entry.schema';
 import { OutboxService } from '../outbox/outbox.service';
 import { RabbitMQService } from '../queue/rabbitmq.service';
 import { RedisService } from '../redis/redis.service';
-import { Transaction, TransactionType } from '../transactions/schemas/transaction.schema';
+import { Transaction, TransactionStatus, TransactionType } from '../transactions/schemas/transaction.schema';
 import { TransactionsService } from '../transactions/transactions.service';
-import { Transfer } from './schemas/transfer.schema';
+import { Transfer, TransferStatus } from './schemas/transfer.schema';
 import { Wallet } from './schemas/wallet.schema';
 import { WalletsService } from './wallets.service';
 
@@ -28,6 +28,7 @@ describe('WalletsService', () => {
   const mockSession = {
     withTransaction: jest.fn(async (fn: () => Promise<unknown>) => fn()),
     endSession: jest.fn(),
+    abortTransaction: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -35,26 +36,30 @@ describe('WalletsService', () => {
       create: jest.fn(),
       findById: jest.fn(),
       findByIdAndUpdate: jest.fn(),
+      findOneAndUpdate: jest.fn(),
     };
     transferModel = {
       create: jest.fn(),
       findOne: jest.fn(),
+      findOneAndUpdate: jest.fn(),
     };
     transactionModel = {
       create: jest.fn(),
       find: jest.fn(),
+      aggregate: jest.fn(),
     };
     ledgerEntryModel = {
       find: jest.fn(),
+      aggregate: jest.fn(),
     };
-    transactionsService = { create: jest.fn() };
+    transactionsService = { create: jest.fn(), findByReference: jest.fn() };
     ledgerService = { recordCredit: jest.fn(), recordDebit: jest.fn() };
     outboxService = { enqueue: jest.fn() };
     rabbitMQService = { publish: jest.fn() };
     redisService = {
-      getCachedBalance: jest.fn(),
-      setCachedBalance: jest.fn(),
-      invalidateBalance: jest.fn(),
+      getCachedWallet: jest.fn(),
+      cacheWallet: jest.fn(),
+      invalidateWallets: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -107,39 +112,31 @@ describe('WalletsService', () => {
   });
 
   describe('getWallet', () => {
-    it('seeds the cache from Mongo on a cache miss', async () => {
-      const wallet = {
-        id: 'w1',
-        _id: 'w1',
-        balance: 250,
-        toObject: () => ({ id: 'w1', balance: 250 }),
-      };
+    it('caches the wallet from Mongo on a cache miss', async () => {
+      const plain = { id: 'w1', _id: 'w1', balance: 250 };
+      const wallet = { ...plain, toObject: () => plain };
+      redisService.getCachedWallet.mockResolvedValue(null);
       walletModel.findById.mockResolvedValue(wallet);
-      redisService.getCachedBalance.mockResolvedValue(null);
 
       const result = await service.getWallet('w1');
 
-      expect(redisService.setCachedBalance).toHaveBeenCalledWith('w1', 250);
-      expect(result).toBe(wallet);
+      expect(redisService.cacheWallet).toHaveBeenCalledWith('w1', plain);
+      expect(result).toBe(plain);
     });
 
-    it('returns the cached balance instead of re-reading Mongo on a cache hit', async () => {
-      const wallet = {
-        id: 'w1',
-        _id: 'w1',
-        balance: 250,
-        toObject: () => ({ id: 'w1', balance: 250 }),
-      };
-      walletModel.findById.mockResolvedValue(wallet);
-      redisService.getCachedBalance.mockResolvedValue(99);
+    it('returns the cached wallet without hitting Mongo on a cache hit', async () => {
+      const cached = { id: 'w1', _id: 'w1', balance: 250 };
+      redisService.getCachedWallet.mockResolvedValue(cached);
 
       const result = await service.getWallet('w1');
 
-      expect(redisService.setCachedBalance).not.toHaveBeenCalled();
-      expect(result).toEqual(expect.objectContaining({ balance: 99 }));
+      expect(walletModel.findById).not.toHaveBeenCalled();
+      expect(redisService.cacheWallet).not.toHaveBeenCalled();
+      expect(result).toBe(cached);
     });
 
     it('throws NotFoundException when the wallet does not exist', async () => {
+      redisService.getCachedWallet.mockResolvedValue(null);
       walletModel.findById.mockResolvedValue(null);
 
       await expect(service.getWallet('missing-id')).rejects.toThrow(NotFoundException);
@@ -150,67 +147,207 @@ describe('WalletsService', () => {
     it('increments the balance atomically and records a ledger credit', async () => {
       const walletId = new Types.ObjectId().toString();
       const updatedWallet = { id: walletId, _id: walletId, balance: 150 };
-      walletModel.findByIdAndUpdate.mockResolvedValue(updatedWallet);
+      walletModel.findOneAndUpdate.mockResolvedValue(updatedWallet);
       const transaction = { _id: new Types.ObjectId() };
       transactionsService.create.mockResolvedValue(transaction);
+      const depositDto = { amount: 50, currency: 'GHS' };
 
-      const result = await service.deposit(walletId, { amount: 50 });
+      const result = await service.deposit(walletId, depositDto);
 
-      expect(walletModel.findByIdAndUpdate).toHaveBeenCalledWith(
-        walletId,
-        { $inc: { balance: 50 } },
-        { new: true },
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ _id: walletId, currency: depositDto.currency }),
+        { $inc: { balance: depositDto.amount } },
+        { new: true, session: mockSession },
       );
+
       expect(transactionsService.create).toHaveBeenCalledWith(
-        expect.objectContaining({ type: TransactionType.DEPOSIT, amount: 50 }),
+        expect.objectContaining({ type: TransactionType.DEPOSIT, amount: depositDto.amount }),
+        mockSession,
       );
+
       expect(ledgerService.recordCredit).toHaveBeenCalledWith(
         updatedWallet._id,
         transaction._id,
-        50,
-        150,
+        depositDto.amount,
+        updatedWallet.balance,
+        mockSession,
       );
       expect(result).toBe(updatedWallet);
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(walletId);
     });
 
     it('throws NotFoundException when the wallet does not exist', async () => {
-      walletModel.findByIdAndUpdate.mockResolvedValue(null);
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
-      await expect(service.deposit('missing-id', { amount: 10 })).rejects.toThrow(
+      await expect(service.deposit('missing-id', { amount: 10, currency: 'GHS' })).rejects.toThrow(
         NotFoundException,
       );
+    });
+
+    it('returns the original wallet when retried with a duplicate reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const existingWallet = { id: walletId, _id: walletId, balance: 150 };
+      walletModel.findOneAndUpdate.mockResolvedValue({ id: walletId, _id: walletId, balance: 200 });
+      transactionsService.create.mockRejectedValue(
+        Object.assign(new Error('E11000 duplicate key'), {
+          code: 11000,
+          keyPattern: { reference: 1 },
+        }),
+      );
+      walletModel.findById.mockResolvedValue(existingWallet);
+
+      const result = await service.deposit(walletId, {
+        amount: 50,
+        currency: 'GHS',
+        reference: 'dup-ref',
+      });
+
+      expect(walletModel.findById).toHaveBeenCalledWith(walletId);
+      expect(result).toBe(existingWallet);
+      expect(redisService.invalidateWallets).not.toHaveBeenCalled();
+    });
+
+    it('re-throws a non-duplicate error instead of swallowing it', async () => {
+      const walletId = new Types.ObjectId().toString();
+      walletModel.findOneAndUpdate.mockResolvedValue({ id: walletId, _id: walletId, balance: 200 });
+      transactionsService.create.mockRejectedValue(new Error('unexpected write failure'));
+
+      await expect(
+        service.deposit(walletId, { amount: 50, currency: 'GHS', reference: 'ref-1' }),
+      ).rejects.toThrow('unexpected write failure');
+      expect(walletModel.findById).not.toHaveBeenCalled();
+    });
+
+    it('returns the existing wallet without re-applying when a completed transaction exists for the reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const existingWallet = { id: walletId, _id: walletId, balance: 150 };
+      transactionsService.findByReference.mockResolvedValue({ status: TransactionStatus.COMPLETED });
+      walletModel.findById.mockResolvedValue(existingWallet);
+
+      const result = await service.deposit(walletId, {
+        amount: 50,
+        currency: 'GHS',
+        reference: 'seen-ref',
+      });
+
+      expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(result).toBe(existingWallet);
+    });
+
+    it('does not short-circuit when the existing transaction for the reference is not completed', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const updatedWallet = { id: walletId, _id: walletId, balance: 150 };
+      transactionsService.findByReference.mockResolvedValue({ status: TransactionStatus.PENDING });
+      walletModel.findOneAndUpdate.mockResolvedValue(updatedWallet);
+      transactionsService.create.mockResolvedValue({ _id: new Types.ObjectId() });
+
+      const result = await service.deposit(walletId, {
+        amount: 50,
+        currency: 'GHS',
+        reference: 'pending-ref',
+      });
+
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalled();
+      expect(result).toBe(updatedWallet);
     });
   });
 
   describe('withdraw', () => {
     it('debits the wallet when the balance is sufficient', async () => {
-      const wallet = { id: 'w1', _id: 'w1', balance: 100, save: jest.fn() };
-      walletModel.findById.mockResolvedValue(wallet);
+      const walletId = new Types.ObjectId().toString();
+      const updatedWallet = { id: walletId, _id: walletId, balance: 60 };
+      walletModel.findOneAndUpdate.mockResolvedValue(updatedWallet);
       const transaction = { _id: new Types.ObjectId() };
       transactionsService.create.mockResolvedValue(transaction);
+      const withdrawDto = { amount: 40, currency: 'GHS' };
 
-      const result = await service.withdraw('w1', { amount: 40 });
+      const result = await service.withdraw(walletId, withdrawDto);
 
-      expect(wallet.balance).toBe(60);
-      expect(wallet.save).toHaveBeenCalled();
-      expect(ledgerService.recordDebit).toHaveBeenCalledWith(wallet._id, transaction._id, 40, 60);
-      expect(result).toBe(wallet);
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          _id: walletId,
+          currency: withdrawDto.currency,
+          balance: { $gte: withdrawDto.amount },
+        }),
+        { $inc: { balance: -withdrawDto.amount } },
+        { new: true, session: mockSession },
+      );
+
+      expect(transactionsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: TransactionType.WITHDRAWAL,
+          amount: withdrawDto.amount,
+          balanceAfter: updatedWallet.balance,
+        }),
+        mockSession,
+      );
+
+      expect(ledgerService.recordDebit).toHaveBeenCalledWith(
+        updatedWallet._id,
+        transaction._id,
+        withdrawDto.amount,
+        updatedWallet.balance,
+        mockSession,
+      );
+      expect(result).toBe(updatedWallet);
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(walletId);
     });
 
     it('rejects a withdrawal larger than the current balance', async () => {
-      const wallet = { id: 'w1', _id: 'w1', balance: 10, save: jest.fn() };
-      walletModel.findById.mockResolvedValue(wallet);
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
-      await expect(service.withdraw('w1', { amount: 40 })).rejects.toThrow(BadRequestException);
-      expect(wallet.save).not.toHaveBeenCalled();
+      await expect(service.withdraw('w1', { amount: 40, currency: 'GHS' })).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
-    it('throws NotFoundException when the wallet does not exist', async () => {
-      walletModel.findById.mockResolvedValue(null);
+    it('rejects a withdrawal from a missing or underfunded wallet with a bad request', async () => {
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
-      await expect(service.withdraw('missing-id', { amount: 10 })).rejects.toThrow(
-        NotFoundException,
+      await expect(service.withdraw('missing-id', { amount: 10, currency: 'GHS' })).rejects.toThrow(
+        BadRequestException,
       );
+    });
+
+    it('records the debit only once when the same withdrawal is retried with the same reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const debitedWallet = { id: walletId, _id: walletId, balance: 60 };
+      walletModel.findOneAndUpdate.mockResolvedValue(debitedWallet);
+      transactionsService.create
+        .mockResolvedValueOnce({ _id: new Types.ObjectId() })
+        .mockRejectedValueOnce(
+          Object.assign(new Error('E11000 duplicate key'), {
+            code: 11000,
+            keyPattern: { reference: 1 },
+          }),
+        );
+      walletModel.findById.mockResolvedValue(debitedWallet);
+
+      const dto = { amount: 40, currency: 'GHS', reference: 'retry-ref' };
+      await service.withdraw(walletId, dto);
+      const retry = await service.withdraw(walletId, dto);
+
+      expect(transactionsService.create).toHaveBeenCalledTimes(2);
+      expect(ledgerService.recordDebit).toHaveBeenCalledTimes(1);
+      expect(retry).toBe(debitedWallet);
+    });
+
+    it('returns the existing wallet without re-applying when a completed transaction exists for the reference', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const existingWallet = { id: walletId, _id: walletId, balance: 60 };
+      transactionsService.findByReference.mockResolvedValue({ status: TransactionStatus.COMPLETED });
+      walletModel.findById.mockResolvedValue(existingWallet);
+
+      const result = await service.withdraw(walletId, {
+        amount: 40,
+        currency: 'GHS',
+        reference: 'seen-ref',
+      });
+
+      expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(result).toBe(existingWallet);
     });
   });
 
@@ -219,13 +356,19 @@ describe('WalletsService', () => {
     const toId = new Types.ObjectId();
 
     function mockWallets(fromBalance: number) {
-      const fromWallet = { _id: fromId, balance: fromBalance, save: jest.fn() };
-      const toWallet = { _id: toId, balance: 0 };
-      walletModel.findById.mockImplementation((id: unknown) => {
-        if (String(id) === String(fromId)) return Promise.resolve(fromWallet);
-        if (String(id) === String(toId)) return Promise.resolve(toWallet);
-        return Promise.resolve(null);
-      });
+      const fromWallet = { _id: fromId, balance: fromBalance, currency: 'GHS' };
+      const toWallet = { _id: toId, balance: 0, currency: 'GHS' };
+      walletModel.findById.mockImplementation((id: unknown) => ({
+        session: jest
+          .fn()
+          .mockResolvedValue(
+            String(id) === String(fromId)
+              ? fromWallet
+              : String(id) === String(toId)
+                ? toWallet
+                : null,
+          ),
+      }));
       return { fromWallet, toWallet };
     }
 
@@ -240,7 +383,7 @@ describe('WalletsService', () => {
     });
 
     it('throws NotFoundException when either wallet is missing', async () => {
-      walletModel.findById.mockResolvedValue(null);
+      walletModel.findById.mockReturnValue({ session: jest.fn().mockResolvedValue(null) });
 
       await expect(
         service.transfer({
@@ -253,6 +396,8 @@ describe('WalletsService', () => {
 
     it('rejects a transfer larger than the sender balance', async () => {
       mockWallets(5);
+      transferModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
       await expect(
         service.transfer({
@@ -263,10 +408,12 @@ describe('WalletsService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('debits the sender, records a ledger entry, and publishes a transfer.initiated event', async () => {
-      const { fromWallet } = mockWallets(100);
+    it('debits the sender atomically, records the ledger entry, and stages a transfer.initiated outbox event', async () => {
+      mockWallets(100);
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
       transferModel.create.mockResolvedValue([createdTransfer]);
+      const from = { _id: fromId, balance: 70, currency: 'GHS' };
+      walletModel.findOneAndUpdate.mockResolvedValue(from);
       const debitTransaction = { _id: new Types.ObjectId() };
       transactionModel.create.mockResolvedValue([debitTransaction]);
 
@@ -276,19 +423,37 @@ describe('WalletsService', () => {
         amount: 30,
       });
 
-      expect(fromWallet.balance).toBe(70);
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: fromId.toString(), balance: { $gte: 30 } },
+        { $inc: { balance: -30 } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(transactionModel.create).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            type: TransactionType.TRANSFER_OUT,
+            amount: 30,
+            balanceAfter: 70,
+            reference: `transfer-out:${createdTransfer._id.toString()}`,
+          }),
+        ],
+        { session: mockSession },
+      );
       expect(ledgerService.recordDebit).toHaveBeenCalledWith(
-        fromWallet._id,
+        from._id,
         debitTransaction._id,
         30,
         70,
         mockSession,
       );
-      expect(rabbitMQService.publish).toHaveBeenCalledWith(
+      expect(outboxService.enqueue).toHaveBeenCalledWith(
         'transfer.initiated',
         expect.objectContaining({ transferId: createdTransfer._id.toString(), amount: 30 }),
+        mockSession,
       );
+      expect(rabbitMQService.publish).not.toHaveBeenCalled();
       expect(result).toBe(createdTransfer);
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(fromId.toString());
     });
 
     it('does not create a second transfer when retried with the same idempotency key', async () => {
@@ -296,6 +461,10 @@ describe('WalletsService', () => {
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
       transferModel.create.mockResolvedValue([createdTransfer]);
       transactionModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
+      walletModel.findOneAndUpdate.mockResolvedValue({ _id: fromId, balance: 70, currency: 'GHS' });
+      transferModel.findOne
+        .mockReturnValueOnce({ lean: jest.fn().mockResolvedValue(null) })
+        .mockReturnValue({ lean: jest.fn().mockResolvedValue(createdTransfer) });
 
       const dto = {
         fromWalletId: fromId.toString(),
@@ -314,6 +483,7 @@ describe('WalletsService', () => {
       mockWallets(100);
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
       transferModel.create.mockResolvedValue([createdTransfer]);
+      walletModel.findOneAndUpdate.mockResolvedValue({ _id: fromId, balance: 70, currency: 'GHS' });
       transactionModel.create.mockRejectedValue(new Error('write conflict'));
 
       await expect(
@@ -325,7 +495,211 @@ describe('WalletsService', () => {
       ).rejects.toThrow('write conflict');
 
       expect(mockSession.endSession).toHaveBeenCalled();
-      expect(rabbitMQService.publish).not.toHaveBeenCalled();
+      expect(outboxService.enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('retryTransfer', () => {
+    it('increments retryCount and stages a transfer.retry outbox event in the same transaction', async () => {
+      const transferId = new Types.ObjectId();
+      const fromWalletId = new Types.ObjectId();
+      const toWalletId = new Types.ObjectId();
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        fromWalletId,
+        toWalletId,
+        amount: 30,
+        idempotencyKey: 'key-1',
+      });
+
+      await service.retryTransfer(transferId.toString());
+
+      expect(transferModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: transferId.toString() },
+        { $inc: { retryCount: 1 } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(outboxService.enqueue).toHaveBeenCalledWith(
+        'transfer.retry',
+        {
+          transferId: transferId.toString(),
+          fromWalletId: fromWalletId.toString(),
+          toWalletId: toWalletId.toString(),
+          amount: 30,
+          idempotencyKey: 'key-1',
+        },
+        mockSession,
+      );
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException and stages nothing when the transfer no longer exists', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue(null);
+
+      await expect(service.retryTransfer('missing-id')).rejects.toThrow(NotFoundException);
+      expect(outboxService.enqueue).not.toHaveBeenCalled();
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+  });
+
+  describe('refund', () => {
+    const transferId = new Types.ObjectId();
+    const fromWalletId = new Types.ObjectId();
+    const toWalletId = new Types.ObjectId();
+
+    it('claims the transfer, restores the sender balance, and appends a reversal transaction + ledger credit', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        fromWalletId,
+        toWalletId,
+        amount: 30,
+      });
+      const fromWallet = { id: fromWalletId.toString(), _id: fromWalletId, balance: 100 };
+      walletModel.findOneAndUpdate.mockResolvedValue(fromWallet);
+      const reversal = { _id: new Types.ObjectId() };
+      transactionsService.create.mockResolvedValue(reversal);
+
+      await service.refund(transferId.toString());
+
+      expect(transferModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: transferId.toString(), status: TransferStatus.PENDING },
+        { $set: { status: TransferStatus.REFUNDED } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: fromWalletId },
+        { $inc: { balance: 30 } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(transactionsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          walletId: fromWallet.id,
+          type: TransactionType.TRANSFER_IN,
+          amount: 30,
+          balanceAfter: 100,
+          reference: `refund:${transferId.toString()}`,
+        }),
+        mockSession,
+      );
+      expect(ledgerService.recordCredit).toHaveBeenCalledWith(
+        fromWallet._id,
+        reversal._id,
+        30,
+        100,
+        mockSession,
+      );
+      expect(mockSession.endSession).toHaveBeenCalled();
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(fromWallet.id);
+    });
+
+    it('is an idempotent no-op when the transfer is no longer PENDING', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue(null);
+
+      await expect(service.refund(transferId.toString())).resolves.toBeUndefined();
+
+      expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(ledgerService.recordCredit).not.toHaveBeenCalled();
+      expect(redisService.invalidateWallets).not.toHaveBeenCalled();
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException and records nothing when the sender wallet is missing', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        fromWalletId,
+        toWalletId,
+        amount: 30,
+      });
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
+
+      await expect(service.refund(transferId.toString())).rejects.toThrow(NotFoundException);
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(ledgerService.recordCredit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getWalletSummary', () => {
+    it('returns the wallet with DB-computed stats', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const wallet = { _id: walletId, balance: 120 };
+      walletModel.findById.mockReturnValue({ lean: jest.fn().mockResolvedValue(wallet) });
+      transactionModel.aggregate.mockResolvedValue([
+        { totalDeposited: 150, totalWithdrawn: 30, transactionCount: 3 },
+      ]);
+
+      const result = await service.getWalletSummary(walletId);
+
+      expect(result).toEqual({
+        wallet,
+        totalDeposited: 150,
+        totalWithdrawn: 30,
+        transactionCount: 3,
+      });
+    });
+
+    it('returns zeroed stats when the wallet has no transactions', async () => {
+      const walletId = new Types.ObjectId().toString();
+      walletModel.findById.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ _id: walletId, balance: 0 }),
+      });
+      transactionModel.aggregate.mockResolvedValue([]);
+
+      const result = await service.getWalletSummary(walletId);
+
+      expect(result.totalDeposited).toBe(0);
+      expect(result.totalWithdrawn).toBe(0);
+      expect(result.transactionCount).toBe(0);
+    });
+
+    it('throws NotFoundException when the wallet does not exist', async () => {
+      const walletId = new Types.ObjectId().toString();
+      walletModel.findById.mockReturnValue({ lean: jest.fn().mockResolvedValue(null) });
+
+      await expect(service.getWalletSummary(walletId)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('getWalletTransactions', () => {
+    it('offloads pagination to the DB and returns data with a count', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const rows = [{ _id: 't1' }, { _id: 't2' }];
+      transactionModel.aggregate.mockResolvedValue([{ data: rows, total: [{ count: 5 }] }]);
+
+      const result = await service.getWalletTransactions(walletId, { page: 2, limit: 2 });
+
+      expect(result).toEqual({ data: rows, count: 5 });
+
+      const pipeline = transactionModel.aggregate.mock.calls[0][0];
+      expect(pipeline[0].$match.walletId.toString()).toBe(walletId);
+      expect(pipeline[1].$facet.data).toContainEqual({ $skip: 2 });
+      expect(pipeline[1].$facet.data).toContainEqual({ $limit: 2 });
+    });
+
+    it('defaults count to 0 when the facet total is empty', async () => {
+      const walletId = new Types.ObjectId().toString();
+      transactionModel.aggregate.mockResolvedValue([{ data: [], total: [] }]);
+
+      const result = await service.getWalletTransactions(walletId, {});
+
+      expect(result).toEqual({ data: [], count: 0 });
+    });
+  });
+
+  describe('getWalletLedgerEntries', () => {
+    it('queries ledger entries by walletId and returns paginated data with a count', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const rows = [{ _id: 'l1' }];
+      ledgerEntryModel.aggregate.mockResolvedValue([{ data: rows, total: [{ count: 1 }] }]);
+
+      const result = await service.getWalletLedgerEntries(walletId, { page: 1, limit: 10 });
+
+      expect(result).toEqual({ data: rows, count: 1 });
+
+      const pipeline = ledgerEntryModel.aggregate.mock.calls[0][0];
+      expect(pipeline[0].$match.walletId.toString()).toBe(walletId);
+      expect(pipeline[1].$facet.data).toContainEqual({ $skip: 0 });
+      expect(pipeline[1].$facet.data).toContainEqual({ $limit: 10 });
     });
   });
 });
