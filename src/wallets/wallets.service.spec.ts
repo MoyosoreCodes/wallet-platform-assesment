@@ -461,6 +461,10 @@ describe('WalletsService', () => {
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
       transferModel.create.mockResolvedValue([createdTransfer]);
       transactionModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
+      walletModel.findOneAndUpdate.mockResolvedValue({ _id: fromId, balance: 70, currency: 'GHS' });
+      transferModel.findOne
+        .mockReturnValueOnce({ lean: jest.fn().mockResolvedValue(null) })
+        .mockReturnValue({ lean: jest.fn().mockResolvedValue(createdTransfer) });
 
       const dto = {
         fromWalletId: fromId.toString(),
