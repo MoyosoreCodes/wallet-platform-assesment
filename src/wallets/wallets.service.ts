@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
-import { Connection, Model, ClientSession } from 'mongoose';
+import { Connection, Model, ClientSession, Types } from 'mongoose';
 import { LedgerEntry, LedgerEntryDocument } from '../ledger/schemas/ledger-entry.schema';
 import { LedgerService } from '../ledger/ledger.service';
 import { OutboxService } from '../outbox/outbox.service';
@@ -20,6 +20,7 @@ import { WithdrawDto } from './dto/withdraw.dto';
 import { Transfer, TransferDocument, TransferStatus } from './schemas/transfer.schema';
 import { Wallet, WalletDocument } from './schemas/wallet.schema';
 import { isDuplicateKey } from '../common/helpers/db/duplicate-key-handler';
+import { PaginationDto } from '../common/dto/pagination.dto';
 
 @Injectable()
 export class WalletsService {
@@ -420,42 +421,114 @@ export class WalletsService {
     }
   }
 
-  async getDashboard(id: string) {
-    const wallet = await this.walletModel.findById(id);
-    if (!wallet) {
-      throw new NotFoundException(`Wallet ${id} not found`);
-    }
+  async getWalletSummary(id: string) {
+    const wallet = await this.walletModel.findById(id).lean();
+    if (!wallet) throw new NotFoundException(`Wallet ${id} not found`);
 
-    const transactions = await this.transactionModel
-      .find({ walletId: id })
-      .sort({ createdAt: -1 })
-      .exec();
-
-    let totalDeposited = 0;
-    let totalWithdrawn = 0;
-    const recentActivity: Array<{
-      transaction: TransactionDocument;
-      entries: LedgerEntryDocument[];
-    }> = [];
-
-    for (const txn of transactions) {
-      const entries = await this.ledgerEntryModel.find({ transactionId: txn._id }).exec();
-
-      if (txn.type === TransactionType.DEPOSIT || txn.type === TransactionType.TRANSFER_IN) {
-        totalDeposited += txn.amount;
-      } else {
-        totalWithdrawn += txn.amount;
-      }
-
-      recentActivity.push({ transaction: txn, entries });
-    }
+    const [stats] = await this.transactionModel.aggregate([
+      { $match: { walletId: new Types.ObjectId(id) } },
+      {
+        $group: {
+          _id: null,
+          totalDeposited: {
+            $sum: {
+              $cond: [
+                { $in: ['$type', [TransactionType.DEPOSIT, TransactionType.TRANSFER_IN]] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          totalWithdrawn: {
+            $sum: {
+              $cond: [
+                { $in: ['$type', [TransactionType.WITHDRAWAL, TransactionType.TRANSFER_OUT]] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          transactionCount: { $sum: 1 },
+        },
+      },
+    ]);
 
     return {
       wallet,
-      totalDeposited,
-      totalWithdrawn,
-      transactionCount: transactions.length,
-      recentActivity: recentActivity.slice(0, 10),
+      totalDeposited: stats?.totalDeposited ?? 0,
+      totalWithdrawn: stats?.totalWithdrawn ?? 0,
+      transactionCount: stats?.transactionCount ?? 0,
+    };
+  }
+
+  async getWalletTransactions(id: string, query: PaginationDto) {
+    const page = Number(query.page ?? 1);
+    const size = Number(query.limit ?? 10);
+    const skip = (page - 1) * size;
+
+    const [result] = await this.transactionModel.aggregate([
+      { $match: { walletId: new Types.ObjectId(id) } },
+      {
+        $facet: {
+          data: [
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: size },
+            {
+              $project: {
+                type: 1,
+                amount: 1,
+                status: 1,
+                balanceAfter: 1,
+                reference: 1,
+                transferId: 1,
+                counterpartyWalletId: 1,
+                createdAt: 1,
+              },
+            },
+          ],
+          total: [{ $count: 'count' }],
+        },
+      },
+    ]);
+
+    return {
+      data: result.data,
+      count: result.total[0]?.count ?? 0,
+    };
+  }
+
+  async getWalletLedgerEntries(id: string, query: PaginationDto) {
+    const page = Number(query.page ?? 1);
+    const size = Number(query.limit ?? 10);
+    const skip = (page - 1) * size;
+
+    const [result] = await this.ledgerEntryModel.aggregate([
+      { $match: { walletId: new Types.ObjectId(id) } },
+      {
+        $facet: {
+          data: [
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: size },
+            {
+              $project: {
+                transactionId: 1,
+                direction: 1,
+                amount: 1,
+                balanceAfter: 1,
+                createdAt: 1,
+              },
+            },
+          ],
+          total: [{ $count: 'count' }],
+        },
+      },
+    ]);
+
+    return {
+      data: result.data,
+      count: result.total[0]?.count ?? 0,
     };
   }
 }
