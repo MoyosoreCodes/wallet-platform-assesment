@@ -34,3 +34,8 @@ export class Transfer {
 }
 
 export const TransferSchema = SchemaFactory.createForClass(Transfer);
+
+TransferSchema.index(
+  { idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } },
+);

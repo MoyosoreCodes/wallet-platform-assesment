@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { ConsumeMessage } from 'amqplib';
-import { Model } from 'mongoose';
+import { Connection, Model } from 'mongoose';
 import { LedgerService } from '../ledger/ledger.service';
 import {
   Transaction,
@@ -12,11 +12,13 @@ import {
 import { Transfer, TransferDocument, TransferStatus } from '../wallets/schemas/transfer.schema';
 import { Wallet, WalletDocument } from '../wallets/schemas/wallet.schema';
 import { RabbitMQService } from './rabbitmq.service';
+import { isDuplicateKey } from '../common/helpers/db/duplicate-key-handler';
 
 export interface TransferInitiatedEvent {
   transferId: string;
   fromWalletId: string;
   toWalletId: string;
+  idempotencyKey?: string;
   amount: number;
 }
 
@@ -25,6 +27,7 @@ export class TransferEventsConsumer implements OnModuleInit {
   private readonly logger = new Logger(TransferEventsConsumer.name);
 
   constructor(
+    @InjectConnection() private readonly connection: Connection,
     private readonly rabbitMQService: RabbitMQService,
     @InjectModel(Transfer.name) private readonly transferModel: Model<TransferDocument>,
     @InjectModel(Wallet.name) private readonly walletModel: Model<WalletDocument>,
@@ -58,43 +61,70 @@ export class TransferEventsConsumer implements OnModuleInit {
   }
 
   private async completeTransfer(event: TransferInitiatedEvent) {
-    const transfer = await this.transferModel.findById(event.transferId);
-    if (!transfer) {
-      this.logger.warn(`Transfer ${event.transferId} not found, skipping`);
-      return;
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(
+        async () => {
+          let transfer = await this.transferModel.findById(event.transferId).session(session);
+          if (!transfer) throw new Error(`Transfer ${event.transferId} not found, skipping`);
+
+          const toWallet = await this.walletModel.findOneAndUpdate(
+            { _id: event.toWalletId },
+            { $inc: { balance: event.amount } },
+            { new: true, session },
+          );
+
+          if (!toWallet)
+            throw new Error(`Destination wallet ${event.toWalletId} not found, skipping`);
+
+          const [creditTransaction] = await this.transactionModel.create(
+            [
+              {
+                walletId: toWallet._id,
+                type: TransactionType.TRANSFER_IN,
+                amount: event.amount,
+                status: TransactionStatus.COMPLETED,
+                balanceAfter: toWallet.balance,
+                transferId: transfer._id,
+                counterpartyWalletId: transfer.fromWalletId,
+                reference: `transfer-in:${event.transferId}`,
+              },
+            ],
+            { session },
+          );
+
+          await this.ledgerService.recordCredit(
+            toWallet._id,
+            creditTransaction._id,
+            event.amount,
+            toWallet.balance,
+            session,
+          );
+
+          transfer = await this.transferModel.findOneAndUpdate(
+            { _id: event.transferId },
+            {
+              $set: { status: TransferStatus.COMPLETED },
+            },
+            { new: true, session },
+          );
+
+          if (!transfer) throw new Error(`Transfer ${event.transferId} not found, skipping`);
+          this.logger.log(`Transfer ${transfer._id} completed for wallet ${toWallet.id}`);
+        },
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority' },
+        },
+      );
+    } catch (error) {
+      if (isDuplicateKey(error, ['reference'])) {
+        this.logger.warn(`Transfer ${event.transferId} already completed, skipping duplicate`);
+        return this.transferModel.findById(event.transferId).lean();
+      }
+      throw error;
+    } finally {
+      await session.endSession();
     }
-
-    const toWallet = await this.walletModel.findById(event.toWalletId);
-    if (!toWallet) {
-      this.logger.warn(`Destination wallet ${event.toWalletId} not found, skipping`);
-      return;
-    }
-
-    toWallet.balance += event.amount;
-    await toWallet.save();
-
-    const [creditTransaction] = await this.transactionModel.create([
-      {
-        walletId: toWallet._id,
-        type: TransactionType.TRANSFER_IN,
-        amount: event.amount,
-        status: TransactionStatus.COMPLETED,
-        balanceAfter: toWallet.balance,
-        transferId: transfer._id,
-        counterpartyWalletId: transfer.fromWalletId,
-      },
-    ]);
-
-    await this.ledgerService.recordCredit(
-      toWallet._id,
-      creditTransaction._id,
-      event.amount,
-      toWallet.balance,
-    );
-
-    transfer.status = TransferStatus.COMPLETED;
-    await transfer.save();
-
-    this.logger.log(`Transfer ${transfer.id} completed for wallet ${toWallet.id}`);
   }
 }

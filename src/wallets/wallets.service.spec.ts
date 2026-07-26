@@ -358,13 +358,19 @@ describe('WalletsService', () => {
     const toId = new Types.ObjectId();
 
     function mockWallets(fromBalance: number) {
-      const fromWallet = { _id: fromId, balance: fromBalance, save: jest.fn() };
-      const toWallet = { _id: toId, balance: 0 };
-      walletModel.findById.mockImplementation((id: unknown) => {
-        if (String(id) === String(fromId)) return Promise.resolve(fromWallet);
-        if (String(id) === String(toId)) return Promise.resolve(toWallet);
-        return Promise.resolve(null);
-      });
+      const fromWallet = { _id: fromId, balance: fromBalance, currency: 'GHS' };
+      const toWallet = { _id: toId, balance: 0, currency: 'GHS' };
+      walletModel.findById.mockImplementation((id: unknown) => ({
+        session: jest
+          .fn()
+          .mockResolvedValue(
+            String(id) === String(fromId)
+              ? fromWallet
+              : String(id) === String(toId)
+                ? toWallet
+                : null,
+          ),
+      }));
       return { fromWallet, toWallet };
     }
 
@@ -379,7 +385,7 @@ describe('WalletsService', () => {
     });
 
     it('throws NotFoundException when either wallet is missing', async () => {
-      walletModel.findById.mockResolvedValue(null);
+      walletModel.findById.mockReturnValue({ session: jest.fn().mockResolvedValue(null) });
 
       await expect(
         service.transfer({
@@ -392,6 +398,8 @@ describe('WalletsService', () => {
 
     it('rejects a transfer larger than the sender balance', async () => {
       mockWallets(5);
+      transferModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
 
       await expect(
         service.transfer({
@@ -399,13 +407,15 @@ describe('WalletsService', () => {
           toWalletId: toId.toString(),
           amount: 10,
         }),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(NotFoundException);
     });
 
-    it('debits the sender, records a ledger entry, and publishes a transfer.initiated event', async () => {
-      const { fromWallet } = mockWallets(100);
+    it('debits the sender atomically, records the ledger entry, and stages a transfer.initiated outbox event', async () => {
+      mockWallets(100);
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
       transferModel.create.mockResolvedValue([createdTransfer]);
+      const from = { _id: fromId, balance: 70, currency: 'GHS' };
+      walletModel.findOneAndUpdate.mockResolvedValue(from);
       const debitTransaction = { _id: new Types.ObjectId() };
       transactionModel.create.mockResolvedValue([debitTransaction]);
 
@@ -415,18 +425,35 @@ describe('WalletsService', () => {
         amount: 30,
       });
 
-      expect(fromWallet.balance).toBe(70);
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: fromId.toString(), balance: { $gte: 30 } },
+        { $inc: { balance: -30 } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(transactionModel.create).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            type: TransactionType.TRANSFER_OUT,
+            amount: 30,
+            balanceAfter: 70,
+            reference: `transfer-out:${createdTransfer._id.toString()}`,
+          }),
+        ],
+        { session: mockSession },
+      );
       expect(ledgerService.recordDebit).toHaveBeenCalledWith(
-        fromWallet._id,
+        from._id,
         debitTransaction._id,
         30,
         70,
         mockSession,
       );
-      expect(rabbitMQService.publish).toHaveBeenCalledWith(
+      expect(outboxService.enqueue).toHaveBeenCalledWith(
         'transfer.initiated',
         expect.objectContaining({ transferId: createdTransfer._id.toString(), amount: 30 }),
+        mockSession,
       );
+      expect(rabbitMQService.publish).not.toHaveBeenCalled();
       expect(result).toBe(createdTransfer);
     });
 
@@ -453,6 +480,7 @@ describe('WalletsService', () => {
       mockWallets(100);
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
       transferModel.create.mockResolvedValue([createdTransfer]);
+      walletModel.findOneAndUpdate.mockResolvedValue({ _id: fromId, balance: 70, currency: 'GHS' });
       transactionModel.create.mockRejectedValue(new Error('write conflict'));
 
       await expect(
@@ -464,7 +492,7 @@ describe('WalletsService', () => {
       ).rejects.toThrow('write conflict');
 
       expect(mockSession.endSession).toHaveBeenCalled();
-      expect(rabbitMQService.publish).not.toHaveBeenCalled();
+      expect(outboxService.enqueue).not.toHaveBeenCalled();
     });
   });
 });
