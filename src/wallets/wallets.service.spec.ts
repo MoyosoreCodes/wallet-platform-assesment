@@ -9,7 +9,7 @@ import { RabbitMQService } from '../queue/rabbitmq.service';
 import { RedisService } from '../redis/redis.service';
 import { Transaction, TransactionStatus, TransactionType } from '../transactions/schemas/transaction.schema';
 import { TransactionsService } from '../transactions/transactions.service';
-import { Transfer } from './schemas/transfer.schema';
+import { Transfer, TransferStatus } from './schemas/transfer.schema';
 import { Wallet } from './schemas/wallet.schema';
 import { WalletsService } from './wallets.service';
 
@@ -41,6 +41,7 @@ describe('WalletsService', () => {
     transferModel = {
       create: jest.fn(),
       findOne: jest.fn(),
+      findOneAndUpdate: jest.fn(),
     };
     transactionModel = {
       create: jest.fn(),
@@ -493,6 +494,124 @@ describe('WalletsService', () => {
 
       expect(mockSession.endSession).toHaveBeenCalled();
       expect(outboxService.enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('retryTransfer', () => {
+    it('increments retryCount and stages a transfer.retry outbox event in the same transaction', async () => {
+      const transferId = new Types.ObjectId();
+      const fromWalletId = new Types.ObjectId();
+      const toWalletId = new Types.ObjectId();
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        fromWalletId,
+        toWalletId,
+        amount: 30,
+        idempotencyKey: 'key-1',
+      });
+
+      await service.retryTransfer(transferId.toString());
+
+      expect(transferModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: transferId.toString() },
+        { $inc: { retryCount: 1 } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(outboxService.enqueue).toHaveBeenCalledWith(
+        'transfer.retry',
+        {
+          transferId: transferId.toString(),
+          fromWalletId: fromWalletId.toString(),
+          toWalletId: toWalletId.toString(),
+          amount: 30,
+          idempotencyKey: 'key-1',
+        },
+        mockSession,
+      );
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException and stages nothing when the transfer no longer exists', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue(null);
+
+      await expect(service.retryTransfer('missing-id')).rejects.toThrow(NotFoundException);
+      expect(outboxService.enqueue).not.toHaveBeenCalled();
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+  });
+
+  describe('refund', () => {
+    const transferId = new Types.ObjectId();
+    const fromWalletId = new Types.ObjectId();
+    const toWalletId = new Types.ObjectId();
+
+    it('claims the transfer, restores the sender balance, and appends a reversal transaction + ledger credit', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        fromWalletId,
+        toWalletId,
+        amount: 30,
+      });
+      const fromWallet = { id: fromWalletId.toString(), _id: fromWalletId, balance: 100 };
+      walletModel.findOneAndUpdate.mockResolvedValue(fromWallet);
+      const reversal = { _id: new Types.ObjectId() };
+      transactionsService.create.mockResolvedValue(reversal);
+
+      await service.refund(transferId.toString());
+
+      expect(transferModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: transferId.toString(), status: TransferStatus.PENDING },
+        { $set: { status: TransferStatus.REFUNDED } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(walletModel.findOneAndUpdate).toHaveBeenCalledWith(
+        { _id: fromWalletId },
+        { $inc: { balance: 30 } },
+        expect.objectContaining({ new: true, session: mockSession }),
+      );
+      expect(transactionsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          walletId: fromWallet.id,
+          type: TransactionType.TRANSFER_IN,
+          amount: 30,
+          balanceAfter: 100,
+          reference: `refund:${transferId.toString()}`,
+        }),
+        mockSession,
+      );
+      expect(ledgerService.recordCredit).toHaveBeenCalledWith(
+        fromWallet._id,
+        reversal._id,
+        30,
+        100,
+        mockSession,
+      );
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+
+    it('is an idempotent no-op when the transfer is no longer PENDING', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue(null);
+
+      await expect(service.refund(transferId.toString())).resolves.toBeUndefined();
+
+      expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(ledgerService.recordCredit).not.toHaveBeenCalled();
+      expect(mockSession.endSession).toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException and records nothing when the sender wallet is missing', async () => {
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        fromWalletId,
+        toWalletId,
+        amount: 30,
+      });
+      walletModel.findOneAndUpdate.mockResolvedValue(null);
+
+      await expect(service.refund(transferId.toString())).rejects.toThrow(NotFoundException);
+      expect(transactionsService.create).not.toHaveBeenCalled();
+      expect(ledgerService.recordCredit).not.toHaveBeenCalled();
     });
   });
 });
