@@ -12,6 +12,7 @@ import {
 import { Transfer, TransferDocument, TransferStatus } from '../wallets/schemas/transfer.schema';
 import { Wallet, WalletDocument } from '../wallets/schemas/wallet.schema';
 import { RabbitMQService } from './rabbitmq.service';
+import { RedisService } from '../redis/redis.service';
 import { isDuplicateKey } from '../common/helpers/db/duplicate-key-handler';
 
 export interface TransferInitiatedEvent {
@@ -34,6 +35,7 @@ export class TransferEventsConsumer implements OnModuleInit {
     @InjectModel(Transaction.name)
     private readonly transactionModel: Model<TransactionDocument>,
     private readonly ledgerService: LedgerService,
+    private readonly redisService: RedisService,
   ) {}
 
   onModuleInit() {
@@ -162,5 +164,7 @@ export class TransferEventsConsumer implements OnModuleInit {
     } finally {
       await session.endSession();
     }
+
+    await this.redisService.invalidateWallets(event.toWalletId);
   }
 }

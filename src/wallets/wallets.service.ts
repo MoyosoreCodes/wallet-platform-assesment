@@ -71,18 +71,19 @@ export class WalletsService {
   }
 
   async getWallet(id: string) {
+    const cachedWallet = await this.redisService.getCachedWallet(id);
+    if (cachedWallet) {
+      return cachedWallet;
+    }
+
     const wallet = await this.walletModel.findById(id);
     if (!wallet) {
       throw new NotFoundException(`Wallet ${id} not found`);
     }
 
-    const cachedBalance = await this.redisService.getCachedBalance(id);
-    if (cachedBalance !== null) {
-      return { ...wallet.toObject(), balance: cachedBalance };
-    }
-
-    await this.redisService.setCachedBalance(id, wallet.balance);
-    return wallet;
+    const plainWallet = wallet.toObject();
+    await this.redisService.cacheWallet(id, plainWallet);
+    return plainWallet;
   }
 
   async deposit(id: string, dto: DepositDto, session?: ClientSession) {
@@ -141,6 +142,8 @@ export class WalletsService {
     } finally {
       if (!externalSession) await session.endSession();
     }
+
+    if (!externalSession) await this.redisService.invalidateWallets(id);
 
     return wallet;
   }
@@ -202,6 +205,8 @@ export class WalletsService {
     } finally {
       if (!externalSession) await session.endSession();
     }
+
+    if (!externalSession) await this.redisService.invalidateWallets(id);
 
     return wallet;
   }
@@ -318,11 +323,14 @@ export class WalletsService {
       await session.endSession();
     }
 
+    await this.redisService.invalidateWallets(dto.fromWalletId);
+
     return transfer;
   }
 
   async refund(transferId: string) {
     const session = await this.connection.startSession();
+    let refundedWalletId: string | undefined;
     try {
       await session.withTransaction(
         async () => {
@@ -341,6 +349,8 @@ export class WalletsService {
           );
 
           if (!fromWallet) throw new NotFoundException(`Wallet ${transfer.fromWalletId} not found`);
+
+          refundedWalletId = fromWallet.id;
 
           const reversal = await this.transactionsService.create(
             {
@@ -371,6 +381,8 @@ export class WalletsService {
     } finally {
       await session.endSession();
     }
+
+    if (refundedWalletId) await this.redisService.invalidateWallets(refundedWalletId);
   }
 
   async retryTransfer(transferId: string) {

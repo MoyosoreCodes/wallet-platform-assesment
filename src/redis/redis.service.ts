@@ -19,26 +19,31 @@ export class RedisService implements OnModuleDestroy {
     this.client.on('error', (err) => this.logger.error(`Redis error: ${err.message}`));
   }
 
-  private walletBalanceKey(walletId: string): string {
-    return `wallet:balance:${walletId}`;
+  private walletKey(walletId: string): string {
+    return `wallet:${walletId}`;
   }
 
-  async getCachedBalance(walletId: string): Promise<number | null> {
-    const value = await this.client.get(this.walletBalanceKey(walletId));
-    return value === null ? null : parseFloat(value);
+  async getCachedWallet(walletId: string): Promise<Record<string, unknown> | null> {
+    const value = await this.client.get(this.walletKey(walletId));
+    return value === null ? null : JSON.parse(value);
   }
 
-  async setCachedBalance(walletId: string, balance: number): Promise<void> {
-    await this.client.set(
-      this.walletBalanceKey(walletId),
-      balance.toString(),
-      'EX',
-      this.ttlSeconds,
+  async cacheWallet(walletId: string, wallet: object): Promise<void> {
+    await this.client.set(this.walletKey(walletId), JSON.stringify(wallet), 'EX', this.ttlSeconds);
+  }
+
+  async invalidateWallet(walletId: string): Promise<void> {
+    await this.client.del(this.walletKey(walletId));
+  }
+
+  async invalidateWallets(...walletIds: string[]): Promise<void> {
+    await Promise.all(
+      walletIds.map((walletId) =>
+        this.invalidateWallet(walletId).catch((error: Error) =>
+          this.logger.warn(`Failed to invalidate cached wallet ${walletId}: ${error.message}`),
+        ),
+      ),
     );
-  }
-
-  async invalidateBalance(walletId: string): Promise<void> {
-    await this.client.del(this.walletBalanceKey(walletId));
   }
 
   getClient(): Redis {

@@ -55,9 +55,9 @@ describe('WalletsService', () => {
     outboxService = { enqueue: jest.fn() };
     rabbitMQService = { publish: jest.fn() };
     redisService = {
-      getCachedBalance: jest.fn(),
-      setCachedBalance: jest.fn(),
-      invalidateBalance: jest.fn(),
+      getCachedWallet: jest.fn(),
+      cacheWallet: jest.fn(),
+      invalidateWallets: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -110,39 +110,31 @@ describe('WalletsService', () => {
   });
 
   describe('getWallet', () => {
-    it('seeds the cache from Mongo on a cache miss', async () => {
-      const wallet = {
-        id: 'w1',
-        _id: 'w1',
-        balance: 250,
-        toObject: () => ({ id: 'w1', balance: 250 }),
-      };
+    it('caches the wallet from Mongo on a cache miss', async () => {
+      const plain = { id: 'w1', _id: 'w1', balance: 250 };
+      const wallet = { ...plain, toObject: () => plain };
+      redisService.getCachedWallet.mockResolvedValue(null);
       walletModel.findById.mockResolvedValue(wallet);
-      redisService.getCachedBalance.mockResolvedValue(null);
 
       const result = await service.getWallet('w1');
 
-      expect(redisService.setCachedBalance).toHaveBeenCalledWith('w1', 250);
-      expect(result).toBe(wallet);
+      expect(redisService.cacheWallet).toHaveBeenCalledWith('w1', plain);
+      expect(result).toBe(plain);
     });
 
-    it('returns the cached balance instead of re-reading Mongo on a cache hit', async () => {
-      const wallet = {
-        id: 'w1',
-        _id: 'w1',
-        balance: 250,
-        toObject: () => ({ id: 'w1', balance: 250 }),
-      };
-      walletModel.findById.mockResolvedValue(wallet);
-      redisService.getCachedBalance.mockResolvedValue(99);
+    it('returns the cached wallet without hitting Mongo on a cache hit', async () => {
+      const cached = { id: 'w1', _id: 'w1', balance: 250 };
+      redisService.getCachedWallet.mockResolvedValue(cached);
 
       const result = await service.getWallet('w1');
 
-      expect(redisService.setCachedBalance).not.toHaveBeenCalled();
-      expect(result).toEqual(expect.objectContaining({ balance: 99 }));
+      expect(walletModel.findById).not.toHaveBeenCalled();
+      expect(redisService.cacheWallet).not.toHaveBeenCalled();
+      expect(result).toBe(cached);
     });
 
     it('throws NotFoundException when the wallet does not exist', async () => {
+      redisService.getCachedWallet.mockResolvedValue(null);
       walletModel.findById.mockResolvedValue(null);
 
       await expect(service.getWallet('missing-id')).rejects.toThrow(NotFoundException);
@@ -179,6 +171,7 @@ describe('WalletsService', () => {
         mockSession,
       );
       expect(result).toBe(updatedWallet);
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(walletId);
     });
 
     it('throws NotFoundException when the wallet does not exist', async () => {
@@ -209,6 +202,7 @@ describe('WalletsService', () => {
 
       expect(walletModel.findById).toHaveBeenCalledWith(walletId);
       expect(result).toBe(existingWallet);
+      expect(redisService.invalidateWallets).not.toHaveBeenCalled();
     });
 
     it('re-throws a non-duplicate error instead of swallowing it', async () => {
@@ -295,6 +289,7 @@ describe('WalletsService', () => {
         mockSession,
       );
       expect(result).toBe(updatedWallet);
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(walletId);
     });
 
     it('rejects a withdrawal larger than the current balance', async () => {
@@ -456,6 +451,7 @@ describe('WalletsService', () => {
       );
       expect(rabbitMQService.publish).not.toHaveBeenCalled();
       expect(result).toBe(createdTransfer);
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(fromId.toString());
     });
 
     it('does not create a second transfer when retried with the same idempotency key', async () => {
@@ -587,6 +583,7 @@ describe('WalletsService', () => {
         mockSession,
       );
       expect(mockSession.endSession).toHaveBeenCalled();
+      expect(redisService.invalidateWallets).toHaveBeenCalledWith(fromWallet.id);
     });
 
     it('is an idempotent no-op when the transfer is no longer PENDING', async () => {
@@ -597,6 +594,7 @@ describe('WalletsService', () => {
       expect(walletModel.findOneAndUpdate).not.toHaveBeenCalled();
       expect(transactionsService.create).not.toHaveBeenCalled();
       expect(ledgerService.recordCredit).not.toHaveBeenCalled();
+      expect(redisService.invalidateWallets).not.toHaveBeenCalled();
       expect(mockSession.endSession).toHaveBeenCalled();
     });
 

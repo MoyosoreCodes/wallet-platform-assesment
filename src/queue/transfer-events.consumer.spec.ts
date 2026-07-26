@@ -6,6 +6,7 @@ import { Transaction, TransactionType } from '../transactions/schemas/transactio
 import { Transfer, TransferStatus } from '../wallets/schemas/transfer.schema';
 import { Wallet } from '../wallets/schemas/wallet.schema';
 import { RabbitMQService } from './rabbitmq.service';
+import { RedisService } from '../redis/redis.service';
 import { TransferEventsConsumer } from './transfer-events.consumer';
 
 describe('TransferEventsConsumer', () => {
@@ -14,6 +15,7 @@ describe('TransferEventsConsumer', () => {
   let walletModel: any;
   let transactionModel: any;
   let ledgerService: any;
+  let redisService: any;
 
   const mockSession = {
     withTransaction: jest.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -25,6 +27,7 @@ describe('TransferEventsConsumer', () => {
     walletModel = { findOneAndUpdate: jest.fn() };
     transactionModel = { create: jest.fn() };
     ledgerService = { recordCredit: jest.fn() };
+    redisService = { invalidateWallets: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -41,6 +44,7 @@ describe('TransferEventsConsumer', () => {
         { provide: getModelToken(Wallet.name), useValue: walletModel },
         { provide: getModelToken(Transaction.name), useValue: transactionModel },
         { provide: LedgerService, useValue: ledgerService },
+        { provide: RedisService, useValue: redisService },
       ],
     }).compile();
 
@@ -99,6 +103,7 @@ describe('TransferEventsConsumer', () => {
       expect.objectContaining({ new: true, session: mockSession }),
     );
     expect(mockSession.endSession).toHaveBeenCalled();
+    expect(redisService.invalidateWallets).toHaveBeenCalledWith(event.toWalletId);
   });
 
   it('returns the existing transfer without re-crediting on a duplicate reference redelivery', async () => {
@@ -127,6 +132,7 @@ describe('TransferEventsConsumer', () => {
     expect(result).toBe(leanTransfer);
     expect(ledgerService.recordCredit).not.toHaveBeenCalled();
     expect(transferModel.findOneAndUpdate).not.toHaveBeenCalled();
+    expect(redisService.invalidateWallets).not.toHaveBeenCalled();
     expect(mockSession.endSession).toHaveBeenCalled();
   });
 
