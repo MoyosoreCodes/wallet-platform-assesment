@@ -46,9 +46,11 @@ describe('WalletsService', () => {
     transactionModel = {
       create: jest.fn(),
       find: jest.fn(),
+      aggregate: jest.fn(),
     };
     ledgerEntryModel = {
       find: jest.fn(),
+      aggregate: jest.fn(),
     };
     transactionsService = { create: jest.fn(), findByReference: jest.fn() };
     ledgerService = { recordCredit: jest.fn(), recordDebit: jest.fn() };
@@ -610,6 +612,90 @@ describe('WalletsService', () => {
       await expect(service.refund(transferId.toString())).rejects.toThrow(NotFoundException);
       expect(transactionsService.create).not.toHaveBeenCalled();
       expect(ledgerService.recordCredit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getWalletSummary', () => {
+    it('returns the wallet with DB-computed stats', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const wallet = { _id: walletId, balance: 120 };
+      walletModel.findById.mockReturnValue({ lean: jest.fn().mockResolvedValue(wallet) });
+      transactionModel.aggregate.mockResolvedValue([
+        { totalDeposited: 150, totalWithdrawn: 30, transactionCount: 3 },
+      ]);
+
+      const result = await service.getWalletSummary(walletId);
+
+      expect(result).toEqual({
+        wallet,
+        totalDeposited: 150,
+        totalWithdrawn: 30,
+        transactionCount: 3,
+      });
+    });
+
+    it('returns zeroed stats when the wallet has no transactions', async () => {
+      const walletId = new Types.ObjectId().toString();
+      walletModel.findById.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ _id: walletId, balance: 0 }),
+      });
+      transactionModel.aggregate.mockResolvedValue([]);
+
+      const result = await service.getWalletSummary(walletId);
+
+      expect(result.totalDeposited).toBe(0);
+      expect(result.totalWithdrawn).toBe(0);
+      expect(result.transactionCount).toBe(0);
+    });
+
+    it('throws NotFoundException when the wallet does not exist', async () => {
+      const walletId = new Types.ObjectId().toString();
+      walletModel.findById.mockReturnValue({ lean: jest.fn().mockResolvedValue(null) });
+
+      await expect(service.getWalletSummary(walletId)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('getWalletTransactions', () => {
+    it('offloads pagination to the DB and returns data with a count', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const rows = [{ _id: 't1' }, { _id: 't2' }];
+      transactionModel.aggregate.mockResolvedValue([{ data: rows, total: [{ count: 5 }] }]);
+
+      const result = await service.getWalletTransactions(walletId, { page: 2, limit: 2 });
+
+      expect(result).toEqual({ data: rows, count: 5 });
+
+      const pipeline = transactionModel.aggregate.mock.calls[0][0];
+      expect(pipeline[0].$match.walletId.toString()).toBe(walletId);
+      expect(pipeline[1].$facet.data).toContainEqual({ $skip: 2 });
+      expect(pipeline[1].$facet.data).toContainEqual({ $limit: 2 });
+    });
+
+    it('defaults count to 0 when the facet total is empty', async () => {
+      const walletId = new Types.ObjectId().toString();
+      transactionModel.aggregate.mockResolvedValue([{ data: [], total: [] }]);
+
+      const result = await service.getWalletTransactions(walletId, {});
+
+      expect(result).toEqual({ data: [], count: 0 });
+    });
+  });
+
+  describe('getWalletLedgerEntries', () => {
+    it('queries ledger entries by walletId and returns paginated data with a count', async () => {
+      const walletId = new Types.ObjectId().toString();
+      const rows = [{ _id: 'l1' }];
+      ledgerEntryModel.aggregate.mockResolvedValue([{ data: rows, total: [{ count: 1 }] }]);
+
+      const result = await service.getWalletLedgerEntries(walletId, { page: 1, limit: 10 });
+
+      expect(result).toEqual({ data: rows, count: 1 });
+
+      const pipeline = ledgerEntryModel.aggregate.mock.calls[0][0];
+      expect(pipeline[0].$match.walletId.toString()).toBe(walletId);
+      expect(pipeline[1].$facet.data).toContainEqual({ $skip: 0 });
+      expect(pipeline[1].$facet.data).toContainEqual({ $limit: 10 });
     });
   });
 });
