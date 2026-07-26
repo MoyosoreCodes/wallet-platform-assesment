@@ -1,5 +1,17 @@
 # Design Notes
 
+## Important and breaking changes
+
+- Deposit and withdraw now require a currency field. A caller that left it out
+  before will get a 400. See section 5.
+- The dashboard endpoint is gone. GET /wallets/:id/dashboard is replaced by three
+  endpoints: /summary, /transactions, and /ledger-entries. . See section 5.
+- Bad input now returns 400 instead of 500. A malformed wallet id, a missing
+  wallet, or an insufficient balance all come back as 400. See section 5.
+- New env variable PENDING_TRANSFER_MAX_RETRY_COUNT (default 3). It caps how many
+  times the sweeper re-drives a stuck transfer before it refunds. It is already in
+  .env.example. See section 5.
+
 ## 1. What issues did you find?
 
 I went through the write paths, the event flow, and the workers by reading the
